@@ -142,12 +142,11 @@ public class CameraDomeGizmo : MonoBehaviour
 
     private void Update()
     {
+        #if UNITY_EDITOR
         if (EditorApplication.isPlaying && !EditorApplication.isPaused)
             currentTime += Time.deltaTime;
         else
             currentTime = 0;
-
-
-
+        #endif
     }
 }

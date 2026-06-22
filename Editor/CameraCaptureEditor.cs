@@ -117,10 +117,88 @@ public class CameraCaptureEditor : EditorWindow
 
     }
 
-    private static Quaternion QuaternionFromMatrix(Matrix4x4 m)
+    private static Quaternion QuaternionFromMatrixRH(Matrix4x4 m)
     {
-        return Quaternion.LookRotation(m.GetColumn(2), m.GetColumn(1));
+        Quaternion q = new Quaternion();
+        float tr = m.m00 + m.m11 + m.m22;
+
+        if (tr > 0)
+        {
+            float S = Mathf.Sqrt(tr + 1.0f) * 2f; 
+            q.w = 0.25f * S;
+            q.x = (m.m21 - m.m12) / S;
+            q.y = (m.m02 - m.m20) / S;
+            q.z = (m.m10 - m.m01) / S;
+        }
+        else if ((m.m00 > m.m11) && (m.m00 > m.m22))
+        {
+            float S = Mathf.Sqrt(1.0f + m.m00 - m.m11 - m.m22) * 2f; 
+            q.w = (m.m21 - m.m12) / S;
+            q.x = 0.25f * S;
+            q.y = (m.m01 + m.m10) / S;
+            q.z = (m.m02 + m.m20) / S;
+        }
+        else if (m.m11 > m.m22)
+        {
+            float S = Mathf.Sqrt(1.0f + m.m11 - m.m00 - m.m22) * 2f; 
+            q.w = (m.m02 - m.m20) / S;
+            q.x = (m.m01 + m.m10) / S;
+            q.y = 0.25f * S;
+            q.z = (m.m12 + m.m21) / S;
+        }
+        else
+        {
+            float S = Mathf.Sqrt(1.0f + m.m22 - m.m00 - m.m11) * 2f; 
+            q.w = (m.m10 - m.m01) / S;
+            q.x = (m.m02 + m.m20) / S;
+            q.y = (m.m12 + m.m21) / S;
+            q.z = 0.25f * S;
+        }
+        return q;
     }
+
+    // Convert Unity world coordinates to the COLMAP/OpenCV world used by this exporter.
+    // Unity:  X right, Y up,   Z forward
+    // COLMAP: X right, Y down, Z forward
+    private static Vector3 UnityToColmapPoint(Vector3 p)
+    {
+        return new Vector3(p.x, -p.y, p.z);
+    }
+
+    private static Vector3 UnityToColmapDirection(Vector3 v)
+    {
+        return new Vector3(v.x, -v.y, v.z);
+    }
+
+    private static Quaternion NormalizeQuaternion(Quaternion q)
+    {
+        float mag = Mathf.Sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+        if (mag <= Mathf.Epsilon)
+            return Quaternion.identity;
+        float inv = 1.0f / mag;
+        return new Quaternion(q.x * inv, q.y * inv, q.z * inv, q.w * inv);
+    }
+
+    private static void GetColmapPoseFromUnityCamera(Camera cam, out Quaternion q, out Vector3 t)
+    {
+        Vector3 c = UnityToColmapPoint(cam.transform.position);
+
+        // Rows of COLMAP/OpenCV world-to-camera rotation.
+        // X camera axis is right, Y camera axis is down, Z camera axis is forward.
+        Vector3 cvRight = UnityToColmapDirection(cam.transform.right).normalized;
+        Vector3 cvDown = UnityToColmapDirection(-cam.transform.up).normalized;
+        Vector3 cvForward = UnityToColmapDirection(cam.transform.forward).normalized;
+
+        Matrix4x4 R_w2c = Matrix4x4.identity;
+        R_w2c.SetRow(0, new Vector4(cvRight.x, cvRight.y, cvRight.z, 0));
+        R_w2c.SetRow(1, new Vector4(cvDown.x, cvDown.y, cvDown.z, 0));
+        R_w2c.SetRow(2, new Vector4(cvForward.x, cvForward.y, cvForward.z, 0));
+        R_w2c.SetRow(3, new Vector4(0, 0, 0, 1));
+
+        q = NormalizeQuaternion(QuaternionFromMatrixRH(R_w2c));
+        t = R_w2c.MultiplyVector(-c); // COLMAP: X_cam = R * X_world + t, so t = -R * C
+    }
+
 
     private void RunPostshotBatch()
     {
@@ -302,7 +380,9 @@ public class CameraCaptureEditor : EditorWindow
             imgWriter.WriteLine("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, IMAGE_NAME");
             imgWriter.WriteLine("# POINTS2D[] as X, Y, POINT3D_ID");
 
-            RenderTexture rt = new RenderTexture(w, h, 32, RenderTextureFormat.ARGBFloat);
+            // Check if the project is in Linear space. If yes, force sRGB conversion. Otherwise, leave it as Default.
+            RenderTextureReadWrite rwMode = PlayerSettings.colorSpace == ColorSpace.Linear ? RenderTextureReadWrite.sRGB : RenderTextureReadWrite.Default;
+            RenderTexture rt = new RenderTexture(w, h, 32, RenderTextureFormat.ARGB32, rwMode);
             Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
 
             int imageId = 1;
@@ -314,7 +394,14 @@ public class CameraCaptureEditor : EditorWindow
             writer3D.WriteLine("# 3D point list with one line of data per point:");
             writer3D.WriteLine("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)");
             int pointId = 1;
-
+            
+            foreach (MeshRenderer r in GameObject.FindObjectsOfType<MeshRenderer>())
+            {
+                if (!r.GetComponent<Collider>())
+                {
+                    r.gameObject.AddComponent<MeshCollider>();
+                }
+            }
 
             foreach (SkinnedMeshRenderer r in GameObject.FindObjectsOfType<SkinnedMeshRenderer>())
             {
@@ -350,14 +437,7 @@ public class CameraCaptureEditor : EditorWindow
                     cameraToUse.transform.position = position;
                     cameraToUse.transform.LookAt(target);
 
-                    Matrix4x4 worldToCamera = cameraToUse.worldToCameraMatrix;
-                    Matrix4x4 unityToColmap = Matrix4x4.Scale(new Vector3(1, -1, -1));
-                    Matrix4x4 colmapMatrix = unityToColmap * worldToCamera;
-
-                    Matrix4x4 R = colmapMatrix;
-                    R.SetColumn(3, new Vector4(0, 0, 0, 1));
-                    Quaternion q = QuaternionFromMatrix(R);
-                    Vector3 t = new Vector3(colmapMatrix.m03, colmapMatrix.m13, colmapMatrix.m23);
+                    GetColmapPoseFromUnityCamera(cameraToUse, out Quaternion q, out Vector3 t);
 
                     string imageName = $"view_{imageId:D3}.png";
                     string imagePath = Path.Combine(folderPath, imageName);
@@ -370,7 +450,7 @@ public class CameraCaptureEditor : EditorWindow
                     RenderTexture.active = rt;
                     tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
                     tex.Apply();
-                    CapturePointCloudFromCamera(cameraToUse, tex, rays, writer3D, imageId, ref pointId);
+                    CapturePointCloudFromCamera(cameraToUse, tex, rays, writer3D, ref pointId);
 
                     File.WriteAllBytes(imagePath, tex.EncodeToPNG());
 
@@ -415,7 +495,7 @@ public class CameraCaptureEditor : EditorWindow
 
 
 
-                        rt = new RenderTexture(w, h, 32, RenderTextureFormat.ARGBFloat);
+                        rt = new RenderTexture(w, h, 32, RenderTextureFormat.ARGB32, rwMode);
                         tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
 
                         yield return null;
@@ -540,7 +620,9 @@ public class CameraCaptureEditor : EditorWindow
             imgWriter.WriteLine("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, IMAGE_NAME");
             imgWriter.WriteLine("# POINTS2D[] as X, Y, POINT3D_ID");
 
-            RenderTexture rt = new RenderTexture(w, h, 32, RenderTextureFormat.ARGBFloat);
+            // Check if the project is in Linear space. If yes, force sRGB conversion. Otherwise, leave it as Default.
+            RenderTextureReadWrite rwMode = PlayerSettings.colorSpace == ColorSpace.Linear ? RenderTextureReadWrite.sRGB : RenderTextureReadWrite.Default;
+            RenderTexture rt = new RenderTexture(w, h, 32, RenderTextureFormat.ARGB32, rwMode);
 
             Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
 
@@ -582,16 +664,7 @@ public class CameraCaptureEditor : EditorWindow
                             cameraToUse.transform.position = cellCenter;
                             cameraToUse.transform.rotation = Quaternion.LookRotation(dir);
 
-                            Matrix4x4 worldToCamera = cameraToUse.worldToCameraMatrix;
-                            Matrix4x4 unityToColmap = Matrix4x4.Scale(new Vector3(1, -1, -1));
-                            Matrix4x4 colmapMatrix = unityToColmap * worldToCamera;
-
-
-
-                            Matrix4x4 R = colmapMatrix;
-                            R.SetColumn(3, new Vector4(0, 0, 0, 1));
-                            Quaternion q = QuaternionFromMatrix(R);
-                            Vector3 t = new Vector3(colmapMatrix.m03, colmapMatrix.m13, colmapMatrix.m23);
+                            GetColmapPoseFromUnityCamera(cameraToUse, out Quaternion q, out Vector3 t);
 
                             string imageName = $"vol_{imageId:D4}.png";
                             string imagePath = Path.Combine(folderPath, imageName);
@@ -600,6 +673,13 @@ public class CameraCaptureEditor : EditorWindow
                             Plane[] planes = GeometryUtility.CalculateFrustumPlanes(cameraToUse);
                             bool objectVisible = false;
 
+                            foreach (MeshRenderer r in GameObject.FindObjectsOfType<MeshRenderer>())
+                            {
+                                if (!r.GetComponent<Collider>())
+                                {
+                                    r.gameObject.AddComponent<MeshCollider>();
+                                }
+                            }
 
                             foreach (SkinnedMeshRenderer r in GameObject.FindObjectsOfType<SkinnedMeshRenderer>())
                             {
@@ -641,7 +721,7 @@ public class CameraCaptureEditor : EditorWindow
                             RenderTexture.active = rt;
                             tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
                             tex.Apply();
-                            CapturePointCloudFromCamera(cameraToUse, tex, rays, writer3D, imageId, ref pointId);
+                            CapturePointCloudFromCamera(cameraToUse, tex, rays, writer3D, ref pointId);
 
                             byte[] pngData = tex.EncodeToPNG();
                             File.WriteAllBytes(imagePath, pngData);
@@ -691,7 +771,7 @@ public class CameraCaptureEditor : EditorWindow
 
 
 
-                                rt = new RenderTexture(w, h, 32, RenderTextureFormat.ARGBFloat);
+                                rt = new RenderTexture(w, h, 32, RenderTextureFormat.ARGB32, rwMode);
                                 tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
 
                                 yield return null;
@@ -792,45 +872,47 @@ public class CameraCaptureEditor : EditorWindow
 
         return directions;
     }
-    void CapturePointCloudFromCamera(Camera cam, Texture2D tex, int rayCount, StreamWriter writer, int imageId, ref int pointId)
-{
-    int width = tex.width;
-    int height = tex.height;
+    void CapturePointCloudFromCamera(Camera cam, Texture2D tex, int rayCount, StreamWriter writer, ref int pointId)
+    {
+        int width = tex.width;
+        int height = tex.height;
 
-    int sqrtRayCount = Mathf.CeilToInt(Mathf.Sqrt(rayCount));
-    float stepX = width / (float)sqrtRayCount;
-    float stepY = height / (float)sqrtRayCount;
+        int sqrtRayCount = Mathf.CeilToInt(Mathf.Sqrt(rayCount));
+        float stepX = width / (float)sqrtRayCount;
+        float stepY = height / (float)sqrtRayCount;
 
         int noCloudLayer = LayerMask.NameToLayer("NoCloud");
-
         int layerMask = ~(1 << noCloudLayer); 
 
         for (int i = 0; i < sqrtRayCount; i++)
-    {
-        for (int j = 0; j < sqrtRayCount; j++)
         {
-            float px = i * stepX + stepX / 2f;
-            float py = j * stepY + stepY / 2f;
+            for (int j = 0; j < sqrtRayCount; j++)
+            {
+                float px = i * stepX + stepX / 2f;
+                float py = j * stepY + stepY / 2f;
 
-            Ray ray = cam.ScreenPointToRay(new Vector3(px, py, 0));
+                Ray ray = cam.ScreenPointToRay(new Vector3(px, py, 0));
 
-                if (Physics.Raycast(ray, out RaycastHit hit, Mathf.Infinity, layerMask))
+                // ADDED: QueryTriggerInteraction.Ignore so we don't hit invisible trigger boxes
+                if (Physics.Raycast(ray, out RaycastHit hit, Mathf.Infinity, layerMask, QueryTriggerInteraction.Ignore))
                 {
-                    Vector3 worldPos = hit.point;
-                worldPos = new Vector3(worldPos.x * -1, worldPos.y, worldPos.z);
+                    Color color = tex.GetPixel((int)px, (int)py);
 
-                Color color = tex.GetPixel((int)px, (int)py);
-                int r = Mathf.Clamp((int)(color.r * 255), 0, 255);
-                int g = Mathf.Clamp((int)(color.g * 255), 0, 255);
-                int b = Mathf.Clamp((int)(color.b * 255), 0, 255);
+                    // ADDED: If the pixel is fully transparent (Background/Skybox), skip this point!
+                    // This prevents invisible colliders from generating flat walls/ground.
+                    if (color.a < 0.1f)
+                        continue;
 
+                    Vector3 worldPos = UnityToColmapPoint(hit.point);
+
+                    int r = Mathf.Clamp((int)(color.r * 255), 0, 255);
+                    int g = Mathf.Clamp((int)(color.g * 255), 0, 255);
+                    int b = Mathf.Clamp((int)(color.b * 255), 0, 255);
 
                     writer.WriteLine($"{pointId} {worldPos.x.ToString(CultureInfo.InvariantCulture)} {worldPos.y.ToString(CultureInfo.InvariantCulture)} {worldPos.z.ToString(CultureInfo.InvariantCulture)} {r} {g} {b} 1.0");
                     pointId++;
+                }
             }
         }
     }
-}
-
-
 }
